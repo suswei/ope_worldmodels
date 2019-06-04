@@ -108,7 +108,7 @@ def worker(worker_arg_tuple):
 
 def main():
     parser = argparse.ArgumentParser(description='World Models ' + ID)
-    parser.add_argument('--data_dir', '-d', default="/data/wm", help='The base data/output directory')
+    parser.add_argument('--data_dir', '-d', default="./data/wm", help='The base data/output directory')
     parser.add_argument('--game', default='CarRacing-v0',
                         help='Game to use')  # https://gym.openai.com/envs/CarRacing-v0/
     parser.add_argument('--experiment_name', default='experiment_1', help='To isolate its files from others')

@@ -10,6 +10,7 @@ from chainer import training
 from chainer.training import extensions
 try:
     import cupy as cp
+    from chainer.backends import cuda
 except Exception as e:
     None
 
@@ -17,9 +18,15 @@ import numpy as np
 import imageio
 import numba
 
+import gym
+
+
 from lib.utils import log, mkdir, save_images_collage, post_process_image_tensor
 from lib.data import ModelDataset
 from vision import CVAE
+
+from MC_auxiliary import rollout, transform_to_weights, action
+
 
 ID = "model"
 
@@ -203,15 +210,41 @@ class ImageSampler(chainer.training.Extension):
 
 
 class TBPTTUpdater(training.updaters.StandardUpdater):
-    def __init__(self, train_iter, optimizer, device, loss_func, sequence_length):
-        self.sequence_length = sequence_length
-        super(TBPTTUpdater, self).__init__(
-            train_iter, optimizer, device=device,
-            loss_func=loss_func)
+    def __init__(self, train_iter, optimizer, device, loss_func, args, vision, model):
+        self.sequence_length = args.sequence_length
+        self.args = args
+        self.vision = vision
+        self.model = model
+        super(TBPTTUpdater, self).__init__(train_iter, optimizer, device=device,loss_func=loss_func)
 
     def update_core(self):
         train_iter = self.get_iterator('main')
         optimizer = self.get_optimizer('main')
+
+
+        # Train policy on entire dataset given the current transition model
+        env = gym.make(self.args.game)
+        action_dim = len(env.action_space.low)
+        self.args.action_dim = action_dim
+
+        if self.args.weights_type == 1:
+            N = action_dim * (self.args.z_dim + self.args.hidden_dim) + action_dim
+        elif self.args.weights_type == 2:
+            N = self.args.z_dim + 2 * self.args.hidden_dim
+        xmean = np.random.randn(N).astype(np.float32)
+        parameters = xmean
+        W_c, b_c = transform_to_weights(self.args, parameters)
+
+        # rollout in dream given by self.model
+        cumulative_reward, frames = rollout(
+            (0, 0, 0, self.args, self.vision.to_cpu(), self.model.to_cpu(), None, W_c, b_c, None, True))
+
+        # Evaluate said policy using historical data only
+        # for now, set this to cumulative_reward
+        adv_loss = cumulative_reward
+
+        # call the negative of this quantity the adversarial loss and subtract it from loss below, scaled by some lbda
+        lbda = 100
 
         batch = train_iter.__next__()
         total_loss = 0
@@ -228,6 +261,9 @@ class TBPTTUpdater(training.updaters.StandardUpdater):
                                   action[start_idx:end_idx].data,
                                   done[start_idx:end_idx].data,
                                   True if i==0 else False)
+
+            loss -= lbda*adv_loss
+
             optimizer.target.cleargrads()
             loss.backward()
             loss.unchain_backward()
@@ -239,7 +275,7 @@ class TBPTTUpdater(training.updaters.StandardUpdater):
 
 def main():
     parser = argparse.ArgumentParser(description='World Models ' + ID)
-    parser.add_argument('--data_dir', '-d', default="/data/wm", help='The base data/output directory')
+    parser.add_argument('--data_dir', '-d', default="./data/wm", help='The base data/output directory')
     parser.add_argument('--game', default='CarRacing-v0',
                         help='Game to use')  # https://gym.openai.com/envs/CarRacing-v0/
     parser.add_argument('--experiment_name', default='experiment_1', help='To isolate its files from others')
@@ -261,14 +297,26 @@ def main():
     parser.add_argument('--sample_temperature', default=1., type=float, help='Temperature for generating samples')
     parser.add_argument('--gradient_clip', default=0., type=float, help='Clip grads L2 norm threshold. 0 = no clip')
     parser.add_argument('--sequence_length', type=int, default=128, help='sequence length for LSTM for TBPTT')
+    parser.add_argument('--in_dream', action='store_true', help='Whether to train in dream, or real environment')
+    parser.add_argument('--initial_z_noise', default=0., type=float,
+                        help="Gaussian noise std for initial z for dream training")
+    parser.add_argument('--done_threshold', default=0.5, type=float, help='What done probability really means done')
+    parser.add_argument('--temperature', '-t', default=1.0, type=float, help='Temperature (tau) for MDN-RNN (model)')
+    parser.add_argument('--dream_max_len', default=2100, type=int, help="Maximum timesteps for dream to avoid runaway")
+    parser.add_argument('--weights_type', default=1, type=int,
+                        help="1=action_dim*(z_dim+hidden_dim), 2=z_dim+2*hidden_dim")
+    parser.add_argument('--initial_z_size', default=10000, type=int,
+                        help="How many real initial frames to load for dream training")
 
     args = parser.parse_args()
     log(ID, "args =\n " + str(vars(args)).replace(",", ",\n "))
+
 
     output_dir = os.path.join(args.data_dir, args.game, args.experiment_name, ID)
     mkdir(output_dir)
     random_rollouts_dir = os.path.join(args.data_dir, args.game, args.experiment_name, 'random_rollouts')
     vision_dir = os.path.join(args.data_dir, args.game, args.experiment_name, 'vision')
+
 
     log(ID, "Starting")
 
@@ -302,7 +350,8 @@ def main():
     train = ModelDataset(dir=random_rollouts_dir, load_batch_size=args.load_batch_size, verbose=False)
     train_iter = chainer.iterators.SerialIterator(train, batch_size=1, shuffle=False)
 
-    updater = TBPTTUpdater(train_iter, optimizer, args.gpu, model.get_loss_func(), args.sequence_length)
+
+    updater = TBPTTUpdater(train_iter, optimizer, args.gpu, model.get_loss_func(), args, vision, model)
 
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=output_dir)
     trainer.extend(extensions.snapshot(), trigger=(args.snapshot_interval, 'iteration'))
