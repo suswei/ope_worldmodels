@@ -117,6 +117,9 @@ or
 **Notes:**
 
 * At the end of training, a dream rollout is generated just for fun.
+* Changes were made to model.py so that it is trained with the off policy evaluation in mind. Should run with
+`python model.py --z_dim 32 --hidden_dim 256 --mixtures 5 --epoch 20 --predict_done --in_dream`
+game is not specified since CarRacing is default.
 
 ### 4. Controller (C)
 
