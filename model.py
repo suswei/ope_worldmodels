@@ -222,7 +222,7 @@ class TBPTTUpdater(training.updaters.StandardUpdater):
         optimizer = self.get_optimizer('main')
 
 
-        # Train policy on entire dataset given the current transition model
+        # Train policy given the current latent space transition model, M
         env = gym.make(self.args.game)
         action_dim = len(env.action_space.low)
         self.args.action_dim = action_dim
@@ -262,6 +262,7 @@ class TBPTTUpdater(training.updaters.StandardUpdater):
                                   done[start_idx:end_idx].data,
                                   True if i==0 else False)
 
+            # TODO: should adv_loss be subtracted this many times during the for loop?
             loss -= lbda*adv_loss
 
             optimizer.target.cleargrads()

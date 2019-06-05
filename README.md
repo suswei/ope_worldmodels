@@ -1,3 +1,10 @@
+# Modification of AM's World Models implementation
+
+Unless otherwise specified by SW, all documentation below is from AM's readme. 
+
+SW installation troubles:
+* SW couldn't install cupy, vizdoom
+
 # World Models Implementation In Chainer
 This is a fairly complete implementation, in [Chainer](https://chainer.org), of the World Models framework described by David Ha and Jürgen Schmidhuber: https://arxiv.org/abs/1803.10122
 
@@ -117,9 +124,9 @@ or
 **Notes:**
 
 * At the end of training, a dream rollout is generated just for fun.
-* Changes were made to model.py so that it is trained with the off policy evaluation in mind. Should run with
+* SW: Changes were made to model.py so that it is trained with the off policy evaluation in mind. Should run with
 `python model.py --z_dim 32 --hidden_dim 256 --mixtures 5 --epoch 20 --predict_done --in_dream`
-game is not specified since CarRacing is default.
+    * `--game` is not specified since CarRacing is default.
 
 ### 4. Controller (C)
 
