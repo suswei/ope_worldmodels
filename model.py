@@ -15,6 +15,7 @@ except Exception as e:
     None
 
 import numpy as np
+import scipy.stats
 import imageio
 import numba
 
@@ -25,11 +26,62 @@ from lib.utils import log, mkdir, save_images_collage, post_process_image_tensor
 from lib.data import ModelDataset
 from vision import CVAE
 
-from MC_auxiliary import rollout, transform_to_weights, action
-
+from MC_auxiliary import rollout, transform_to_weights
+import MC_auxiliary
 
 ID = "model"
 
+
+def train_LGC(args,vision,model):
+    env = gym.make(args.game)
+    action_dim = len(env.action_space.low)
+    args.action_dim = action_dim
+
+    if args.weights_type == 1:
+        N = action_dim * (args.z_dim + args.hidden_dim) + action_dim
+    elif args.weights_type == 2:
+        N = args.z_dim + 2 * args.hidden_dim
+    xmean = np.random.randn(N).astype(np.float32)
+    parameters = xmean
+    W_c, b_c = transform_to_weights(args, parameters)
+
+    # rollout in dream given by model
+    cumulative_reward, frames = rollout(
+        (0, 0, 0, args, vision.to_cpu(), model.to_cpu(), None, W_c, b_c, None, True))
+
+    return W_c, b_c
+
+
+def ope_LGC(args, model, W_c, b_c):
+
+    random_rollouts_dir = os.path.join(args.data_dir, args.game, args.experiment_name, 'random_rollouts')
+    train = ModelDataset(dir=random_rollouts_dir, load_batch_size=args.load_batch_size, verbose=False)
+
+    ope = 0
+
+    for i in range(len(train)):
+        h_t = np.zeros(args.hidden_dim).astype(np.float32)
+        c_t = np.zeros(args.hidden_dim).astype(np.float32)
+        t = 0
+
+        rollout_z_t, rollout_z_t_plus_1, rollout_action, rollout_reward, rollout_done = train[i]  # Pick a real rollout
+        done = rollout_done[0]
+        weight_prod = 1
+        while not done:
+            z_t = rollout_z_t[t]
+            eval_policy_mean = MC_auxiliary.action(args, W_c, b_c, z_t, h_t, c_t, gpu=None)
+            action_policy_std = 0.1
+            weight_prod *= scipy.stats.multivariate_normal.pdf(rollout_action[t], eval_policy_mean,
+                                                               action_policy_std * np.identity(args.action_dim))
+            ope += weight_prod * rollout_reward[t]
+
+            model(z_t, rollout_action[t], temperature=args.temperature)
+            h_t = model.get_h().data[0]
+            c_t = model.get_c().data[0]
+
+            t += 1
+            done = rollout_done[t]
+    return ope
 
 @numba.jit(nopython=True)
 def optimized_sampling(output_dim, temperature, coef, mu, ln_var):
@@ -218,37 +270,19 @@ class TBPTTUpdater(training.updaters.StandardUpdater):
         super(TBPTTUpdater, self).__init__(train_iter, optimizer, device=device,loss_func=loss_func)
 
     def update_core(self):
+
         train_iter = self.get_iterator('main')
         optimizer = self.get_optimizer('main')
 
+        # Train linear Gaussian controller policy given the current latent space transition model, self.model
+        W_c, b_c = train_LGC(self.args, self.vision, self.model)
 
-        # Train policy given the current latent space transition model, M
-        env = gym.make(self.args.game)
-        action_dim = len(env.action_space.low)
-        self.args.action_dim = action_dim
-
-        if self.args.weights_type == 1:
-            N = action_dim * (self.args.z_dim + self.args.hidden_dim) + action_dim
-        elif self.args.weights_type == 2:
-            N = self.args.z_dim + 2 * self.args.hidden_dim
-        xmean = np.random.randn(N).astype(np.float32)
-        parameters = xmean
-        W_c, b_c = transform_to_weights(self.args, parameters)
-
-        # rollout in dream given by self.model
-        cumulative_reward, frames = rollout(
-            (0, 0, 0, self.args, self.vision.to_cpu(), self.model.to_cpu(), None, W_c, b_c, None, True))
-
-        # Evaluate said policy using historical data only
-        # for now, set this to cumulative_reward
-        adv_loss = cumulative_reward
-
-        # call the negative of this quantity the adversarial loss and subtract it from loss below, scaled by some lbda
-        lbda = 100
+        # Evaluate linear Gaussian controller on historical data
+        ope = ope_LGC(self.args, self.model, W_c, b_c)
 
         batch = train_iter.__next__()
         total_loss = 0
-        z_t, z_t_plus_1, action, done = self.converter(batch, self.device)
+        z_t, z_t_plus_1, action, _, done = self.converter(batch, self.device)
         z_t = chainer.Variable(z_t[0])
         z_t_plus_1 = chainer.Variable(z_t_plus_1[0])
         action = chainer.Variable(action[0])
@@ -262,8 +296,9 @@ class TBPTTUpdater(training.updaters.StandardUpdater):
                                   done[start_idx:end_idx].data,
                                   True if i==0 else False)
 
-            # TODO: should adv_loss be subtracted this many times during the for loop?
-            loss -= lbda*adv_loss
+            # TODO: should adv_loss be subtracted this many times during the for loop? Should not hardcode ope_scale
+            ope_scale = 100
+            loss -= ope_scale*ope
 
             optimizer.target.cleargrads()
             loss.backward()
@@ -362,7 +397,7 @@ def main():
         trainer.extend(extensions.ProgressBar(update_interval=10 if args.gpu >= 0 else 1))
 
     sample_size = 256
-    rollout_z_t, rollout_z_t_plus_1, rollout_action, done = train[0]
+    rollout_z_t, rollout_z_t_plus_1, rollout_action, _, done = train[0]
     sample_z_t = rollout_z_t[0:sample_size]
     sample_z_t_plus_1 = rollout_z_t_plus_1[0:sample_size]
     sample_action = rollout_action[0:sample_size]

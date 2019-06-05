@@ -29,6 +29,17 @@ ID = "MC_auxiliary"
 initial_z_t = None
 
 
+def transform_to_weights(args, parameters):
+    if args.weights_type == 1:
+        W_c = parameters[0:args.action_dim * (args.z_dim + args.hidden_dim)].reshape(args.action_dim,
+                                                                                     args.z_dim + args.hidden_dim)
+        b_c = parameters[args.action_dim * (args.z_dim + args.hidden_dim):]
+    elif args.weights_type == 2:
+        W_c = parameters
+        b_c = None
+    return W_c, b_c
+
+
 def action(args, W_c, b_c, z_t, h_t, c_t, gpu):
     if args.weights_type == 1:
         input = F.concat((z_t, h_t), axis=0).data
@@ -61,17 +72,6 @@ def action(args, W_c, b_c, z_t, h_t, c_t, gpu):
     return action
 
 
-def transform_to_weights(args, parameters):
-    if args.weights_type == 1:
-        W_c = parameters[0:args.action_dim * (args.z_dim + args.hidden_dim)].reshape(args.action_dim,
-                                                                                     args.z_dim + args.hidden_dim)
-        b_c = parameters[args.action_dim * (args.z_dim + args.hidden_dim):]
-    elif args.weights_type == 2:
-        W_c = parameters
-        b_c = None
-    return W_c, b_c
-
-
 def rollout(rollout_arg_tuple):
     try:
         global initial_z_t
@@ -99,7 +99,7 @@ def rollout(rollout_arg_tuple):
 
 
         if args.in_dream:
-            z_t, _, _, _ = initial_z_t[np.random.randint(len(initial_z_t))]
+            z_t, _, _, _, _ = initial_z_t[np.random.randint(len(initial_z_t))]
             z_t = z_t[0]
             if gpu is not None:
                 z_t = cuda.to_gpu(z_t)
@@ -146,7 +146,12 @@ def rollout(rollout_arg_tuple):
                     observation = cuda.to_gpu(observation)
                 z_t = vision.encode(observation, return_z=True).data[0]
 
-            a_t = action(args, W_c, b_c, z_t, h_t, c_t, gpu)
+            mean_a_t = action(args, W_c, b_c, z_t, h_t, c_t, gpu)
+
+            # TODO: should not hard code gaussian policy scale like this, also need to be sure action sampled remains in action space
+            action_policy_std = 0.1
+            a_t = np.random.multivariate_normal(mean=mean_a_t, cov=action_policy_std * np.identity(args.action_dim))
+            a_t = a_t.astype('float32')
 
             if args.in_dream:
                 z_t, done = model(z_t, a_t, temperature=args.temperature)

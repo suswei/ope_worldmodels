@@ -20,7 +20,7 @@ except Exception as e:
     None
 from model import MDN_RNN
 from vision import CVAE
-from controller import transform_to_weights, action
+from MC_auxiliary import action, transform_to_weights
 
 ID = "test"
 

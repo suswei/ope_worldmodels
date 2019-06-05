@@ -27,9 +27,10 @@ def load_model_npz_worker(files):
 
     npz = np.load(npz2)
     action = npz['action']
+    reward = npz['reward']
     npz.close()
 
-    return mu, ln_var, action
+    return mu, ln_var, action, reward
 
 
 class VisionDataset(dataset.DatasetMixin):
@@ -228,10 +229,12 @@ class ModelDataset(dataset.DatasetMixin):
         mu = []
         ln_var = []
         action = []
-        for rollout_mu, rollout_ln_var, rollout_action in data:
+        reward = []
+        for rollout_mu, rollout_ln_var, rollout_action, rollout_reward in data:
             mu.append(rollout_mu)
             ln_var.append(rollout_ln_var)
             action.append(rollout_action)
+            reward.append(rollout_reward)
 
         if self.verbose:
             log("ModelDataset", "*** Loaded batch " + str(batch) + ", from index " + str(batch_start_idx) + ":" + str(
@@ -244,6 +247,7 @@ class ModelDataset(dataset.DatasetMixin):
         self.mu = mu
         self.ln_var = ln_var
         self.action = action
+        self.reward = reward
         self.batch = batch
 
     def get_current_batch_size(self):
@@ -261,9 +265,9 @@ class ModelDataset(dataset.DatasetMixin):
         # are not doing batched loading, shuffle every epoch:
         if self.load_batch_size >= len(self.rollouts):
             if index == 0 and self.last_index > 0:
-                shuffled = list(zip(self.mu, self.ln_var, self.action))
+                shuffled = list(zip(self.mu, self.ln_var, self.action, self.reward))
                 random.shuffle(shuffled)
-                self.mu, self.ln_var, self.action = zip(*shuffled)
+                self.mu, self.ln_var, self.action, self.reward = zip(*shuffled)
             self.last_index = index
 
         # reconstruct every time, prevent overfitting:
@@ -274,4 +278,4 @@ class ModelDataset(dataset.DatasetMixin):
         done = np.zeros((z_t_plus_1.shape[0], 1)).astype(np.int32)
         done[-1, 0] = 1.
 
-        return z_t, z_t_plus_1, self.action[index], done
+        return z_t, z_t_plus_1, self.action[index], self.reward[index], done
