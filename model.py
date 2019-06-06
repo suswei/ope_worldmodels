@@ -19,37 +19,46 @@ import scipy.stats
 import imageio
 import numba
 
-import gym
 
+from chainer import optimizers
+
+import gym
 
 from lib.utils import log, mkdir, save_images_collage, post_process_image_tensor
 from lib.data import ModelDataset
 from vision import CVAE
 
-from MC_auxiliary import rollout, transform_to_weights
+from MC_auxiliary import rollout_network
 import MC_auxiliary
 
 ID = "model"
 
 
-def train_LGC(args,vision,model):
-    env = gym.make(args.game)
-    action_dim = len(env.action_space.low)
-    args.action_dim = action_dim
+def train_LGC(args, vision, model):
 
-    if args.weights_type == 1:
-        N = action_dim * (args.z_dim + args.hidden_dim) + action_dim
-    elif args.weights_type == 2:
-        N = args.z_dim + 2 * args.hidden_dim
-    xmean = np.random.randn(N).astype(np.float32)
-    parameters = xmean
-    W_c, b_c = transform_to_weights(args, parameters)
+    rn = rollout_network(args, vision, model)
+    rn_optimizer = optimizers.MomentumSGD(lr=0.01, momentum=0.9)
+    rn_optimizer.setup(rn)
 
-    # rollout in dream given by model
-    cumulative_reward, frames = rollout(
-        (0, 0, 0, args, vision.to_cpu(), model.to_cpu(), None, W_c, b_c, None, True))
 
-    return W_c, b_c
+    random_rollouts_dir = os.path.join(args.data_dir, args.game, args.experiment_name, 'random_rollouts')
+    initial_z_t = ModelDataset(dir=random_rollouts_dir,
+                               load_batch_size=args.initial_z_size,
+                               verbose=False)
+
+    input, _, _, _, _ = initial_z_t[np.random.randint(len(initial_z_t))]
+
+    # forward pass
+    cumulative_reward = rn(input)
+
+    loss = -cumulative_reward
+
+    rn.cleargrads()
+    loss.backward()
+
+    rn_optimizer.update()
+
+    return rn.W_c.W.data, rn.W_c.b._data
 
 
 def ope_LGC(args, model, W_c, b_c):
@@ -70,6 +79,7 @@ def ope_LGC(args, model, W_c, b_c):
         while not done:
             z_t = rollout_z_t[t]
             eval_policy_mean = MC_auxiliary.action(args, W_c, b_c, z_t, h_t, c_t, gpu=None)
+            eval_policy_mean = np.transpose(eval_policy_mean).reshape(args.action_dim)
             action_policy_std = 0.1
             weight_prod *= scipy.stats.multivariate_normal.pdf(rollout_action[t], eval_policy_mean,
                                                                action_policy_std * np.identity(args.action_dim))
@@ -386,6 +396,10 @@ def main():
     train = ModelDataset(dir=random_rollouts_dir, load_batch_size=args.load_batch_size, verbose=False)
     train_iter = chainer.iterators.SerialIterator(train, batch_size=1, shuffle=False)
 
+
+    env = gym.make(args.game)
+    action_dim = len(env.action_space.low)
+    args.action_dim = action_dim
 
     updater = TBPTTUpdater(train_iter, optimizer, args.gpu, model.get_loss_func(), args, vision, model)
 
