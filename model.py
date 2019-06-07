@@ -13,14 +13,17 @@ try:
     from chainer.backends import cuda
 except Exception as e:
     None
+import chainer.distributions as D
 
 import numpy as np
 import scipy.stats
 import imageio
 import numba
 
+from itertools import count
 
 from chainer import optimizers
+from chainer import Chain
 
 import gym
 
@@ -28,41 +31,193 @@ from lib.utils import log, mkdir, save_images_collage, post_process_image_tensor
 from lib.data import ModelDataset
 from vision import CVAE
 
-from MC_auxiliary import rollout_network
 import MC_auxiliary
 
 ID = "model"
 
 
-def train_LGC(args, vision, model):
+class PolicyNet(Chain):
 
-    rn = rollout_network(args, vision, model)
-    rn_optimizer = optimizers.MomentumSGD(lr=0.01, momentum=0.9)
-    rn_optimizer.setup(rn)
+    def __init__(self, args):
+        super(PolicyNet, self).__init__()
+        with self.init_scope():
+            self.args = args
+            self.W_c = L.Linear(None, args.action_dim)
 
+    def forward(self, args, z_t, h_t, c_t):
+        if args.gpu < 0:
+            gpu = None
+
+        if args.weights_type == 1:
+            input = F.concat((z_t, h_t), axis=0).data
+            input = F.reshape(input, (1, input.shape[0]))
+            action = F.tanh(self.W_c(input)).data
+        elif args.weights_type == 2:
+            input = F.concat((z_t, h_t, c_t), axis=0).data
+            dot = self.W_c(input)
+            if gpu is not None:
+                dot = cp.asarray(dot)
+            else:
+                dot = np.asarray(dot)
+            output = F.tanh(dot)
+            if output == 1.:
+                output = 0.999
+            action_dim = args.action_dim + 1
+            action_range = 2 / action_dim
+            action = [0. for i in range(action_dim)]
+            start = -1.
+            for i in range(action_dim):
+                if start <= output and output <= (start + action_range):
+                    action[i] = 1.
+                    break
+                start += action_range
+            mid = action_dim // 2  # reserve action[mid] for no action
+            action = action[0:mid] + action[mid + 1:action_dim]
+        if gpu is not None:
+            action = cp.asarray(action).astype(cp.float32)
+        else:
+            action = np.asarray(action).astype(np.float32)
+        return action
+
+
+def train_lgc(args, model):
+    """
+    Train a stochastic (Gaussian) policy that acts on [z_t,h_t] in a virtual world dictated by model
+    Use policy gradient.
+    :param args:
+    :param vision:
+    :param model:
+    :return: coefficients of linear controller, W_c and b_c in W_c [z_t,h_t] + b_c
+    """
+    episode_durations = []
 
     random_rollouts_dir = os.path.join(args.data_dir, args.game, args.experiment_name, 'random_rollouts')
     initial_z_t = ModelDataset(dir=random_rollouts_dir,
                                load_batch_size=args.initial_z_size,
                                verbose=False)
 
-    input, _, _, _, _ = initial_z_t[np.random.randint(len(initial_z_t))]
+    num_episode = 10
+    batch_size = 5
+    gamma = 0.99
 
-    # forward pass
-    cumulative_reward = rn(input)
+    policy_net = PolicyNet(args)
+    optimizer = optimizers.MomentumSGD(lr=0.01, momentum=0.9)
+    optimizer.setup(policy_net)
 
-    loss = -cumulative_reward
+    if args.gpu < 0:
+        gpu = None
 
-    rn.cleargrads()
-    loss.backward()
+    # Batch History
+    state_pool = []
+    action_pool = []
+    reward_pool = []
+    steps = 0
 
-    rn_optimizer.update()
-
-    return rn.W_c.W.data, rn.W_c.b._data
 
 
-def ope_LGC(args, model, W_c, b_c):
+    for e in range(num_episode):
 
+        # grab initial state tuple (z_t, h_t, c_t) from historical random rollouts
+        z_t, _, _, _, _ = initial_z_t[np.random.randint(len(initial_z_t))]
+        z_t = z_t[0]
+        if gpu is not None:
+            z_t = cuda.to_gpu(z_t)
+        if args.initial_z_noise > 0.:
+            if gpu is not None:
+                z_t += cp.random.normal(0., args.initial_z_noise, z_t.shape).astype(cp.float32)
+            else:
+                z_t += np.random.normal(0., args.initial_z_noise, z_t.shape).astype(np.float32)
+        if gpu is not None:
+            h_t = cp.zeros(args.hidden_dim).astype(cp.float32)
+            c_t = cp.zeros(args.hidden_dim).astype(cp.float32)
+        else:
+            h_t = np.zeros(args.hidden_dim).astype(np.float32)
+            c_t = np.zeros(args.hidden_dim).astype(np.float32)
+
+        for t in count():
+
+            mean_a_t = policy_net(args, z_t, h_t, c_t)
+            action_policy_std = 0.1
+            cov = action_policy_std * np.identity(args.action_dim)
+            stochastic_policy = D.MultivariateNormal(loc=mean_a_t.astype(np.float32), scale_tril=cov.astype(np.float32))
+            a_t = stochastic_policy.sample()
+
+            z_t, done = model(z_t, a_t, temperature=args.temperature)
+            done = done.data[0]
+            reward = 1.0
+            if done >= args.done_threshold:
+                done = True
+            else:
+                done = False
+
+            h_t = model.get_h().data[0]
+            c_t = model.get_c().data[0]
+
+            state_pool.append((z_t, h_t, c_t))
+            action_pool.append(a_t)
+            reward_pool.append(reward)
+
+            steps += 1
+
+            if done:
+                episode_durations.append(t + 1)
+                break
+
+        # Update policy
+        if e > 0 and e % batch_size == 0:
+
+            # Discount reward
+            running_add = 0
+            for i in reversed(range(steps)):
+                if reward_pool[i] == 0:
+                    running_add = 0
+                else:
+                    running_add = running_add * gamma + reward_pool[i]
+                    reward_pool[i] = running_add
+
+            # Normalize reward
+            reward_mean = np.mean(reward_pool)
+            reward_std = np.std(reward_pool)
+            for i in range(steps):
+                reward_pool[i] = (reward_pool[i] - reward_mean) / reward_std
+
+            # Gradient Desent
+            policy_net.cleargrads()
+
+            for i in range(steps):
+                z_t,h_t,c_t = state_pool[i]
+                action = action_pool[i]
+                reward = reward_pool[i]
+
+                mean_a_t = policy_net(args, z_t, h_t, c_t)
+                action_policy_std = 0.1
+                cov = action_policy_std * np.identity(args.action_dim)
+                stochastic_policy = D.MultivariateNormal(loc=mean_a_t.astype(np.float32),
+                                                         scale_tril=cov.astype(np.float32))
+                loss = -stochastic_policy.log_prob(action) * reward  # Negtive score function x reward
+                loss.backward()
+
+            optimizer.update()
+
+            state_pool = []
+            action_pool = []
+            reward_pool = []
+            steps = 0
+
+    return policy_net
+
+
+def ope_LGC(args, model, policy_net):
+    """
+    Off-policy policy evaluation of a linear Gaussian controller
+    acting as N(W_c * [z_t,h_t] + b_c, 0.1 * identity matrix(args.action_dim))
+    This is done using "historical" data in random_rollouts directory
+    :param args:
+    :param model:
+    :param W_c:
+    :param b_c:
+    :return:
+    """
     random_rollouts_dir = os.path.join(args.data_dir, args.game, args.experiment_name, 'random_rollouts')
     train = ModelDataset(dir=random_rollouts_dir, load_batch_size=args.load_batch_size, verbose=False)
 
@@ -76,11 +231,17 @@ def ope_LGC(args, model, W_c, b_c):
         rollout_z_t, rollout_z_t_plus_1, rollout_action, rollout_reward, rollout_done = train[i]  # Pick a real rollout
         done = rollout_done[0]
         weight_prod = 1
+
         while not done:
+
             z_t = rollout_z_t[t]
-            eval_policy_mean = MC_auxiliary.action(args, W_c, b_c, z_t, h_t, c_t, gpu=None)
+
+            eval_policy_mean = policy_net(args, z_t, h_t, c_t)
             eval_policy_mean = np.transpose(eval_policy_mean).reshape(args.action_dim)
+
+            # TODO: yikes this shouldn't be hardcoded...
             action_policy_std = 0.1
+            #
             weight_prod *= scipy.stats.multivariate_normal.pdf(rollout_action[t], eval_policy_mean,
                                                                action_policy_std * np.identity(args.action_dim))
             ope += weight_prod * rollout_reward[t]
@@ -91,6 +252,7 @@ def ope_LGC(args, model, W_c, b_c):
 
             t += 1
             done = rollout_done[t]
+
     return ope
 
 @numba.jit(nopython=True)
@@ -272,12 +434,12 @@ class ImageSampler(chainer.training.Extension):
 
 
 class TBPTTUpdater(training.updaters.StandardUpdater):
-    def __init__(self, train_iter, optimizer, device, loss_func, args, vision, model):
+    def __init__(self, train_iter, optimizer, loss_func, args, model):
         self.sequence_length = args.sequence_length
         self.args = args
-        self.vision = vision
         self.model = model
-        super(TBPTTUpdater, self).__init__(train_iter, optimizer, device=device,loss_func=loss_func)
+        self.device = args.gpu
+        super(TBPTTUpdater, self).__init__(train_iter, optimizer,loss_func=loss_func)
 
     def update_core(self):
 
@@ -285,10 +447,10 @@ class TBPTTUpdater(training.updaters.StandardUpdater):
         optimizer = self.get_optimizer('main')
 
         # Train linear Gaussian controller policy given the current latent space transition model, self.model
-        W_c, b_c = train_LGC(self.args, self.vision, self.model)
+        policy_net = train_lgc(self.args, self.model)
 
         # Evaluate linear Gaussian controller on historical data
-        ope = ope_LGC(self.args, self.model, W_c, b_c)
+        ope = ope_LGC(self.args, self.model, policy_net)
 
         batch = train_iter.__next__()
         total_loss = 0
@@ -306,7 +468,7 @@ class TBPTTUpdater(training.updaters.StandardUpdater):
                                   done[start_idx:end_idx].data,
                                   True if i==0 else False)
 
-            # TODO: should adv_loss be subtracted this many times during the for loop? Should not hardcode ope_scale
+            # TODO: should the adversarial ope loss be subtracted this many times during the for loop? Should not hardcode ope_scale
             ope_scale = 100
             loss -= ope_scale*ope
 
@@ -401,7 +563,8 @@ def main():
     action_dim = len(env.action_space.low)
     args.action_dim = action_dim
 
-    updater = TBPTTUpdater(train_iter, optimizer, args.gpu, model.get_loss_func(), args, vision, model)
+
+    updater = TBPTTUpdater(train_iter, optimizer, model.get_loss_func(), args, model)
 
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=output_dir)
     trainer.extend(extensions.snapshot(), trigger=(args.snapshot_interval, 'iteration'))
